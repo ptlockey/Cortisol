@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import cycle
 from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly import colors as plotly_colors
 import streamlit as st
 from scipy import stats
 
@@ -271,7 +273,7 @@ def make_auc_timecourse_plot(
                     x=subset["time"],
                     y=y_values,
                     mode="lines+markers",
-                    fill="tozeroy",
+                    fill="tozeroy" if metric_key == "AUCG" else None,
                     name=f"{group} {phase}",
                 )
             )
@@ -283,15 +285,23 @@ def make_auc_timecourse_plot(
     y_axis_title = (
         "Cortisol (nmol/L)"
         if metric_key == "AUCG"
-        else "Cortisol above baseline (nmol/L)"
+        else "Cortisol change from baseline (nmol/L)"
     )
+    yaxis_config = dict(title=y_axis_title)
+    if metric_key == "AUCG":
+        yaxis_config["rangemode"] = "tozero"
+    else:
+        yaxis_config["zeroline"] = True
+        yaxis_config["zerolinecolor"] = "#999999"
+        yaxis_config["zerolinewidth"] = 1
+
     fig.update_layout(
         xaxis=dict(
             title="Time (minutes)",
             tickmode="array",
             tickvals=list(TIME_POINTS),
         ),
-        yaxis=dict(title=y_axis_title, dtick=5),
+        yaxis=yaxis_config,
         template="plotly_white",
         legend_title="Condition",
         hovermode="x unified",
@@ -299,8 +309,29 @@ def make_auc_timecourse_plot(
     return fig
 
 
+def _extract_phase_timecourse(row: pd.Series, phase: str) -> Tuple[List[int], List[float]]:
+    """Return the time points and cortisol values for a phase from a wide row."""
+
+    prefix = PHASE_PREFIXES.get(phase)
+    if prefix is None:
+        return [], []
+
+    times: List[int] = []
+    values: List[float] = []
+    for time_point in TIME_POINTS:
+        column = f"{prefix}{time_point} nmol/l"
+        if column not in row:
+            continue
+        value = pd.to_numeric(pd.Series([row[column]]), errors="coerce").iloc[0]
+        if pd.isna(value):
+            continue
+        times.append(int(time_point))
+        values.append(float(value))
+    return times, values
+
+
 def make_participant_timecourse_plot(
-    row: pd.Series, phases: Iterable[str], y_axis_title: str
+    row: pd.Series, phases: Iterable[str], y_axis_title: str, force_zero_start: bool
 ) -> go.Figure | None:
     """Return a line plot of cortisol values for a single participant."""
 
@@ -308,29 +339,118 @@ def make_participant_timecourse_plot(
     has_trace = False
 
     for phase in phases:
-        prefix = PHASE_PREFIXES.get(phase)
-        if prefix is None:
-            continue
-
-        times: List[int] = []
-        values: List[float] = []
-        for time_point in TIME_POINTS:
-            column = f"{prefix}{time_point} nmol/l"
-            if column not in row:
-                continue
-            value = pd.to_numeric(pd.Series([row[column]]), errors="coerce").iloc[0]
-            if pd.isna(value):
-                continue
-            times.append(int(time_point))
-            values.append(float(value))
-
+        times, values = _extract_phase_timecourse(row, phase)
         if not times:
             continue
-
         fig.add_trace(
             go.Scatter(x=times, y=values, mode="lines+markers", name=phase)
         )
         has_trace = True
+
+    if not has_trace:
+        return None
+
+    yaxis_config = dict(title=y_axis_title)
+    if force_zero_start:
+        yaxis_config["rangemode"] = "tozero"
+
+    fig.update_layout(
+        xaxis=dict(
+            title="Time (minutes)",
+            tickmode="array",
+            tickvals=list(TIME_POINTS),
+        ),
+        yaxis=yaxis_config,
+        template="plotly_white",
+        legend_title="Phase",
+        hovermode="x unified",
+    )
+    return fig
+
+
+def make_group_spaghetti_plot(
+    df: pd.DataFrame,
+    summary_df: pd.DataFrame,
+    participant_column: str,
+    groups: List[str],
+    phases: List[str],
+) -> go.Figure | None:
+    """Show every participant trajectory for the selected groups and phases."""
+
+    if participant_column not in df:
+        return None
+
+    filtered = df[df["GroupLabel"].isin(groups)] if groups else df
+    if filtered.empty:
+        return None
+
+    colour_cycle = cycle(plotly_colors.qualitative.Plotly)
+    colour_map: Dict[Tuple[str, str], str] = {}
+    for group in groups:
+        for phase in phases:
+            colour_map[(group, phase)] = next(colour_cycle)
+
+    fig = go.Figure()
+    has_trace = False
+
+    for (group, phase), colour in colour_map.items():
+        phase_subset = filtered[filtered["GroupLabel"] == group]
+        if phase_subset.empty:
+            continue
+
+        for _, row in phase_subset.iterrows():
+            times, values = _extract_phase_timecourse(row, phase)
+            if not times:
+                continue
+            participant_label = row.get(participant_column, "Unknown")
+            fig.add_trace(
+                go.Scatter(
+                    x=times,
+                    y=values,
+                    mode="lines",
+                    line=dict(color=colour, width=1),
+                    opacity=0.35,
+                    legendgroup=f"{group}-{phase}",
+                    showlegend=False,
+                    hovertemplate=(
+                        "Group: "
+                        + group
+                        + "<br>Phase: "
+                        + phase
+                        + "<br>Participant: %{customdata[0]}"
+                        + "<br>Time: %{x} min<br>Cortisol: %{y:.2f} nmol/L"
+                        + "<extra></extra>"
+                    ),
+                    customdata=np.array([[participant_label]] * len(times)),
+                )
+            )
+            has_trace = True
+
+        summary_subset = summary_df[
+            (summary_df.group == group) & (summary_df.phase == phase)
+        ]
+        if not summary_subset.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=summary_subset["time"],
+                    y=summary_subset["mean"],
+                    mode="lines+markers",
+                    name=f"{group} {phase} mean",
+                    line=dict(color=colour, width=3),
+                    legendgroup=f"{group}-{phase}",
+                    showlegend=True,
+                    hovertemplate=(
+                        "Group: "
+                        + group
+                        + "<br>Phase: "
+                        + phase
+                        + "<br>Time: %{x} min"
+                        + "<br>Mean cortisol: %{y:.2f} nmol/L"
+                        + "<extra></extra>"
+                    ),
+                )
+            )
+            has_trace = True
 
     if not has_trace:
         return None
@@ -341,10 +461,71 @@ def make_participant_timecourse_plot(
             tickmode="array",
             tickvals=list(TIME_POINTS),
         ),
-        yaxis=dict(title=y_axis_title),
+        yaxis=dict(title="Cortisol (nmol/L)", rangemode="tozero"),
         template="plotly_white",
-        legend_title="Phase",
+        legend_title="Condition",
         hovermode="x unified",
+    )
+    return fig
+
+
+def make_individual_auc_plot(
+    auc_df: pd.DataFrame, metric: str, groups: List[str], phases: List[str]
+) -> go.Figure | None:
+    """Display participant-level AUC values for the requested metric."""
+
+    metric_key = metric.strip().upper()
+    subset = auc_df[auc_df["Metric"].str.upper() == metric_key]
+    if groups:
+        subset = subset[subset["Group"].isin(groups)]
+    if phases:
+        subset = subset[subset["Phase"].isin(phases)]
+
+    if subset.empty:
+        return None
+
+    fig = go.Figure()
+    for phase in phases:
+        phase_subset = subset[subset["Phase"] == phase]
+        if phase_subset.empty:
+            continue
+        for group in groups:
+            group_subset = phase_subset[phase_subset["Group"] == group]
+            if group_subset.empty:
+                continue
+            fig.add_trace(
+                go.Box(
+                    y=group_subset["Value"],
+                    name=f"{group} {phase}",
+                    boxpoints="all",
+                    jitter=0.4,
+                    pointpos=0,
+                    marker=dict(size=6),
+                    customdata=np.array(
+                        group_subset["Participant"].astype(str).to_numpy().reshape(-1, 1)
+                    ),
+                    hovertemplate=(
+                        "Group: "
+                        + group
+                        + "<br>Phase: "
+                        + phase
+                        + "<br>Participant: %{customdata[0]}"
+                        + "<br>AUC: %{y:.2f}"
+                        + "<extra></extra>"
+                    ),
+                )
+            )
+
+    yaxis_title = "AUC (nmol/L × min)" if metric_key == "AUCG" else "AUC increase (nmol/L × min)"
+    yaxis_config = dict(title=yaxis_title)
+    if metric_key == "AUCG":
+        yaxis_config["rangemode"] = "tozero"
+
+    fig.update_layout(
+        template="plotly_white",
+        showlegend=False,
+        xaxis_title="Group / Phase",
+        yaxis=yaxis_config,
     )
     return fig
 
@@ -411,6 +592,7 @@ def main() -> None:
 
     st.subheader("Means and standard deviations by time point")
     summary_df = summarise_time_points(df)
+    raw_summary_df = summarise_time_points(raw_df)
     st.dataframe(summary_df)
 
     st.subheader("Cortisol trajectory")
@@ -419,6 +601,32 @@ def main() -> None:
         st.plotly_chart(figure, use_container_width=True)
     else:
         st.info("Select at least one group and phase to display the line plot.")
+
+    st.subheader("Group trajectories (individual participants)")
+    if (
+        participant_column
+        and selected_groups
+        and selected_phases
+        and not raw_df.empty
+    ):
+        spaghetti_fig = make_group_spaghetti_plot(
+            raw_df, raw_summary_df, participant_column, selected_groups, selected_phases
+        )
+        if spaghetti_fig is None:
+            st.info(
+                "Unable to display participant trajectories for the selected combination."
+            )
+        else:
+            st.caption(
+                "Raw cortisol for every participant is plotted with semi-transparent"
+                " lines; bold traces show group means."
+            )
+            st.plotly_chart(spaghetti_fig, use_container_width=True)
+    else:
+        st.info(
+            "Participant identifiers together with at least one group and phase are required"
+            " to display the group trajectory plot."
+        )
 
     st.subheader("Baseline cortisol (individual measurements)")
     if selected_groups and selected_phases:
@@ -434,6 +642,7 @@ def main() -> None:
         y_axis_title = (
             "Log cortisol (ln(nmol/L))" if use_log else "Cortisol (nmol/L)"
         )
+        force_zero_start = not use_log
         st.subheader("Individual participant cortisol trajectories")
         if not selected_phases:
             st.info("Select at least one phase to display participant trajectories.")
@@ -448,7 +657,7 @@ def main() -> None:
                     st.warning("No data available for this participant.")
                     continue
                 figure = make_participant_timecourse_plot(
-                    participant_rows.iloc[0], selected_phases, y_axis_title
+                    participant_rows.iloc[0], selected_phases, y_axis_title, force_zero_start
                 )
                 if figure is None:
                     st.info(
@@ -475,6 +684,21 @@ def main() -> None:
                     st.plotly_chart(auc_figure, use_container_width=True)
     else:
         st.info("Select at least one group and phase to display the AUC plots.")
+
+    st.markdown("### Individual AUC distributions")
+    if selected_groups and selected_phases:
+        auc_tabs = st.tabs(["AUCg", "AUCi"])
+        for metric, tab in zip(["AUCg", "AUCi"], auc_tabs):
+            with tab:
+                individual_auc_fig = make_individual_auc_plot(
+                    auc_df, metric, selected_groups, selected_phases
+                )
+                if individual_auc_fig is None:
+                    st.info("No AUC data available for the selected combination.")
+                else:
+                    st.plotly_chart(individual_auc_fig, use_container_width=True)
+    else:
+        st.info("Select at least one group and phase to display the individual AUC plots.")
 
     summary_auc, p_values = summarise_auc(auc_df)
     table = reshape_auc_summary(summary_auc, p_values)
