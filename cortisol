@@ -1,0 +1,72 @@
+import pandas as pd, numpy as np, matplotlib.pyplot as plt
+from scipy import stats
+
+# --- Load and prepare ---
+df = pd.read_excel("Cortisol.xlsx")
+df.columns = df.columns.str.strip()
+for c in df.columns:
+    if "nmol" in c:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+def auc_trap(values):
+    return np.trapz(values, dx=15)
+
+def summarise(df_in):
+    out = []
+    for g, gdf in df_in.groupby("Group"):
+        gname = "MBLC" if g==1 else "Control"
+        for ph in ["B","P"]:
+            for t in ["0","15","30","45"]:
+                col=f"{ph}{t} nmol/l"
+                out.append({
+                    "Group": gname,
+                    "Phase": "Baseline" if ph=="B" else "Post",
+                    "Time": int(t),
+                    "Mean": gdf[col].mean(),
+                    "SD": gdf[col].std()
+                })
+    return pd.DataFrame(out)
+
+def calc_auc(df_in):
+    aucg, auci = [], []
+    for g, gdf in df_in.groupby("Group"):
+        gname = "MBLC" if g==1 else "Control"
+        for _,row in gdf.iterrows():
+            b=row[[f"B{x} nmol/l" for x in [0,15,30,45]]].to_numpy(float)
+            p=row[[f"P{x} nmol/l" for x in [0,15,30,45]]].to_numpy(float)
+            if np.isnan(b).any() or np.isnan(p).any(): continue
+            gB,gP=auc_trap(b),auc_trap(p)
+            iB=gB - b[0]*45; iP=gP - p[0]*45
+            aucg+=[{"Group":gname,"Phase":"Baseline","AUCg":gB},
+                   {"Group":gname,"Phase":"Post","AUCg":gP}]
+            auci+=[{"Group":gname,"Phase":"Baseline","AUCi":iB},
+                   {"Group":gname,"Phase":"Post","AUCi":iP}]
+    return (pd.DataFrame(aucg), pd.DataFrame(auci))
+
+def plot_curves(df_sum, title):
+    plt.figure(figsize=(8,6))
+    for g,c in zip(["MBLC","Control"],["#1f77b4","#ff7f0e"]):
+        for ph,ls in zip(["Baseline","Post"],["--","-"]):
+            sub=df_sum[(df_sum.Group==g)&(df_sum.Phase==ph)]
+            plt.errorbar(sub.Time,sub.Mean,yerr=sub.SD,fmt=ls,color=c,
+                         capsize=3,linewidth=2,label=f"{g} {ph}")
+    plt.xlabel("Time (min)"); plt.ylabel("Cortisol (nmol/L)")
+    plt.title(title); plt.legend(); plt.grid(alpha=0.3); plt.tight_layout(); plt.show()
+
+# --- Raw cortisol ---
+summary_raw = summarise(df)
+aucg_raw, auci_raw = calc_auc(df)
+print("\nRaw AUCg summary:\n", aucg_raw.groupby(["Group","Phase"])["AUCg"].agg(["mean","std","count"]))
+print("\nRaw AUCi summary:\n", auci_raw.groupby(["Group","Phase"])["AUCi"].agg(["mean","std","count"]))
+plot_curves(summary_raw, "Cortisol (Raw) Pre vs Post")
+
+# --- Log-transformed cortisol ---
+df_log = df.copy()
+for c in df_log.columns:
+    if "nmol" in c:
+        df_log[c] = np.log(df_log[c].clip(lower=0.01))  # avoid log(0)
+summary_log = summarise(df_log)
+aucg_log, auci_log = calc_auc(df_log)
+print("\nLog AUCg summary:\n", aucg_log.groupby(["Group","Phase"])["AUCg"].agg(["mean","std","count"]))
+print("\nLog AUCi summary:\n", auci_log.groupby(["Group","Phase"])["AUCi"].agg(["mean","std","count"]))
+plot_curves(summary_log, "Cortisol (Log-transformed) Pre vs Post")
