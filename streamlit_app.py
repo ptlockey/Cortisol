@@ -530,6 +530,82 @@ def make_individual_auc_plot(
     return fig
 
 
+def make_phase_overlay_plot(
+    df: pd.DataFrame,
+    participant_column: str,
+    groups: List[str],
+    phase: str,
+    use_log_scale: bool,
+) -> go.Figure | None:
+    """Plot each participant's cortisol trajectory for a single phase."""
+
+    if participant_column not in df:
+        return None
+    prefix = PHASE_PREFIXES.get(phase)
+    if prefix is None:
+        return None
+
+    filtered = df.dropna(subset=[participant_column])
+    if groups:
+        filtered = filtered[filtered["GroupLabel"].isin(groups)]
+    if filtered.empty:
+        return None
+
+    colour_cycle = cycle(plotly_colors.qualitative.Dark24)
+    fig = go.Figure()
+    has_trace = False
+
+    for _, row in filtered.iterrows():
+        times, values = _extract_phase_timecourse(row, phase)
+        if not times:
+            continue
+        participant = row.get(participant_column, "Unknown")
+        group = row.get("GroupLabel", "Unknown")
+        colour = next(colour_cycle)
+        fig.add_trace(
+            go.Scatter(
+                x=times,
+                y=values,
+                mode="lines+markers",
+                line=dict(color=colour, width=2),
+                name=str(participant),
+                hovertemplate=(
+                    "Group: "
+                    + str(group)
+                    + "<br>Participant: "
+                    + str(participant)
+                    + "<br>Time: %{x} min"
+                    + "<br>Cortisol: %{y:.2f}"
+                    + (" ln(nmol/L)" if use_log_scale else " nmol/L")
+                    + "<extra></extra>"
+                ),
+            )
+        )
+        has_trace = True
+
+    if not has_trace:
+        return None
+
+    y_axis_title = "Log cortisol (ln(nmol/L))" if use_log_scale else "Cortisol (nmol/L)"
+    yaxis_config = dict(title=y_axis_title)
+    if not use_log_scale:
+        yaxis_config["rangemode"] = "tozero"
+
+    fig.update_layout(
+        title=f"{phase} cortisol trajectories",
+        xaxis=dict(
+            title="Time (minutes)",
+            tickmode="array",
+            tickvals=list(TIME_POINTS),
+        ),
+        yaxis=yaxis_config,
+        template="plotly_white",
+        hovermode="x unified",
+        legend_title="Participant",
+    )
+    return fig
+
+
 def main() -> None:
     st.set_page_config(page_title="Cortisol analysis dashboard", layout="wide")
     st.title("Cortisol time-course analysis")
@@ -637,6 +713,23 @@ def main() -> None:
             st.plotly_chart(baseline_fig, use_container_width=True)
     else:
         st.info("Select at least one group and phase to display the baseline plot.")
+
+    st.subheader("Participant overlays by phase")
+    if participant_column and selected_groups and selected_phases:
+        for phase in selected_phases:
+            overlay_fig = make_phase_overlay_plot(
+                df, participant_column, selected_groups, phase, use_log
+            )
+            if overlay_fig is None:
+                st.info(
+                    f"No cortisol measurements available for the {phase.lower()} phase with the current selections."
+                )
+            else:
+                st.plotly_chart(overlay_fig, use_container_width=True)
+    elif not participant_column:
+        st.info("Participant identifiers are required to display the overlay plots.")
+    else:
+        st.info("Select at least one group and phase to display the overlay plots.")
 
     if participant_column:
         y_axis_title = (
