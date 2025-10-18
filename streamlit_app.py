@@ -295,6 +295,56 @@ def make_auc_timecourse_plot(
     return fig
 
 
+def make_participant_timecourse_plot(
+    row: pd.Series, phases: Iterable[str], y_axis_title: str
+) -> go.Figure | None:
+    """Return a line plot of cortisol values for a single participant."""
+
+    fig = go.Figure()
+    has_trace = False
+
+    for phase in phases:
+        prefix = PHASE_PREFIXES.get(phase)
+        if prefix is None:
+            continue
+
+        times: List[int] = []
+        values: List[float] = []
+        for time_point in TIME_POINTS:
+            column = f"{prefix}{time_point} nmol/l"
+            if column not in row:
+                continue
+            value = pd.to_numeric(pd.Series([row[column]]), errors="coerce").iloc[0]
+            if pd.isna(value):
+                continue
+            times.append(int(time_point))
+            values.append(float(value))
+
+        if not times:
+            continue
+
+        fig.add_trace(
+            go.Scatter(x=times, y=values, mode="lines+markers", name=phase)
+        )
+        has_trace = True
+
+    if not has_trace:
+        return None
+
+    fig.update_layout(
+        xaxis=dict(
+            title="Time (minutes)",
+            tickmode="array",
+            tickvals=list(TIME_POINTS),
+        ),
+        yaxis=dict(title=y_axis_title),
+        template="plotly_white",
+        legend_title="Phase",
+        hovermode="x unified",
+    )
+    return fig
+
+
 def main() -> None:
     st.set_page_config(page_title="Cortisol analysis dashboard", layout="wide")
     st.title("Cortisol time-course analysis")
@@ -315,6 +365,11 @@ def main() -> None:
 
     available_groups = sorted(df["GroupLabel"].dropna().unique().tolist())
     available_phases = list(PHASE_PREFIXES.keys())
+    participant_column = next(
+        (column for column in ("Participant", "ID", "Ppt ID") if column in df.columns),
+        None,
+    )
+    participant_labels: Dict[object, str] = {}
     with st.sidebar:
         selected_groups = st.multiselect(
             "Groups", options=available_groups, default=available_groups
@@ -322,6 +377,30 @@ def main() -> None:
         selected_phases = st.multiselect(
             "Phases", options=available_phases, default=available_phases
         )
+        if participant_column:
+            participant_df = df[[participant_column, "GroupLabel"]].dropna(
+                subset=[participant_column]
+            )
+            if selected_groups:
+                participant_df = participant_df[
+                    participant_df["GroupLabel"].isin(selected_groups)
+                ]
+            participant_df = participant_df.drop_duplicates().sort_values(
+                ["GroupLabel", participant_column]
+            )
+            participant_options = participant_df[participant_column].tolist()
+            participant_labels = {
+                row[participant_column]: f"{row[participant_column]} ({row['GroupLabel']})"
+                for _, row in participant_df.iterrows()
+            }
+            selected_participants = st.multiselect(
+                "Participants",
+                options=participant_options,
+                format_func=lambda value: participant_labels.get(value, str(value)),
+            )
+        else:
+            st.caption("No participant identifier found in the dataset.")
+            selected_participants = []
 
     st.subheader("Raw data preview")
     st.dataframe(df.head())
@@ -346,6 +425,33 @@ def main() -> None:
             st.plotly_chart(baseline_fig, use_container_width=True)
     else:
         st.info("Select at least one group and phase to display the baseline plot.")
+
+    if participant_column:
+        y_axis_title = (
+            "Log cortisol (ln(nmol/L))" if use_log else "Cortisol (nmol/L)"
+        )
+        st.subheader("Individual participant cortisol trajectories")
+        if not selected_phases:
+            st.info("Select at least one phase to display participant trajectories.")
+        elif not selected_participants:
+            st.info("Select one or more participants from the sidebar to display their trajectories.")
+        else:
+            for participant in selected_participants:
+                display_label = participant_labels.get(participant, str(participant))
+                st.markdown(f"#### {display_label}")
+                participant_rows = df[df[participant_column] == participant]
+                if participant_rows.empty:
+                    st.warning("No data available for this participant.")
+                    continue
+                figure = make_participant_timecourse_plot(
+                    participant_rows.iloc[0], selected_phases, y_axis_title
+                )
+                if figure is None:
+                    st.info(
+                        "No cortisol measurements available for the selected phases and participant."
+                    )
+                else:
+                    st.plotly_chart(figure, use_container_width=True)
 
     st.subheader("Area under the curve metrics")
     auc_df = compute_auc(df)
