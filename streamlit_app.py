@@ -45,7 +45,10 @@ def apply_log_transform(df: pd.DataFrame) -> pd.DataFrame:
     ]
     for column in value_columns:
         if column in transformed:
-            transformed[column] = np.log(transformed[column].clip(lower=0.01))
+            numeric = pd.to_numeric(transformed[column], errors="coerce")
+            with np.errstate(divide="ignore"):
+                log_values = np.where(numeric > 0, np.log(numeric), np.nan)
+            transformed[column] = pd.Series(log_values, index=transformed.index)
     return transformed
 
 
@@ -193,6 +196,52 @@ def make_line_plot(summary_df: pd.DataFrame, groups: List[str], phases: List[str
     return fig
 
 
+def make_baseline_distribution_plot(
+    df: pd.DataFrame, groups: List[str], phases: List[str]
+) -> go.Figure | None:
+    """Display individual baseline measurements for the selected groups/phases."""
+
+    phase_columns = {"Baseline": "B0 nmol/l", "Post": "P0 nmol/l"}
+    available_phases = [phase for phase in phases if phase in phase_columns]
+    fig = go.Figure()
+    has_trace = False
+
+    for phase in available_phases:
+        column = phase_columns[phase]
+        if column not in df:
+            continue
+        for group in groups:
+            subset = df[df["GroupLabel"] == group]
+            if subset.empty:
+                continue
+            values = pd.to_numeric(subset[column], errors="coerce").dropna()
+            if values.empty:
+                continue
+            fig.add_trace(
+                go.Box(
+                    y=values,
+                    name=f"{group} {phase}",
+                    boxpoints="all",
+                    jitter=0.4,
+                    pointpos=0,
+                    marker=dict(size=6),
+                )
+            )
+            has_trace = True
+
+    if not has_trace:
+        return None
+
+    fig.update_layout(
+        xaxis_title="Condition",
+        yaxis_title="Cortisol (nmol/L)",
+        template="plotly_white",
+        hovermode="closest",
+        showlegend=False,
+    )
+    return fig
+
+
 def make_auc_timecourse_plot(
     summary_df: pd.DataFrame, groups: List[str], phases: List[str], metric: str
 ) -> go.Figure | None:
@@ -287,6 +336,16 @@ def main() -> None:
         st.plotly_chart(figure, use_container_width=True)
     else:
         st.info("Select at least one group and phase to display the line plot.")
+
+    st.subheader("Baseline cortisol (individual measurements)")
+    if selected_groups and selected_phases:
+        baseline_fig = make_baseline_distribution_plot(raw_df, selected_groups, selected_phases)
+        if baseline_fig is None:
+            st.info("No baseline measurements available for the selected combination.")
+        else:
+            st.plotly_chart(baseline_fig, use_container_width=True)
+    else:
+        st.info("Select at least one group and phase to display the baseline plot.")
 
     st.subheader("Area under the curve metrics")
     auc_df = compute_auc(df)
