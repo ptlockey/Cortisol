@@ -198,8 +198,8 @@ def make_auc_timecourse_plot(
 ) -> go.Figure | None:
     """Create an area plot that visualises the AUC curves for the selections."""
 
-    metric = metric.upper()
-    if metric not in {"AUCg", "AUCi"}:
+    metric_key = metric.strip().upper()
+    if metric_key not in {"AUCG", "AUCI"}:
         raise ValueError("metric must be either 'AUCg' or 'AUCi'")
 
     fig = go.Figure()
@@ -211,7 +211,7 @@ def make_auc_timecourse_plot(
                 continue
             y_values = subset["mean"].to_numpy()
             baseline = y_values[0] if len(y_values) else np.nan
-            if metric == "AUCI":
+            if metric_key == "AUCI":
                 y_values = y_values - baseline
             fig.add_trace(
                 go.Scatter(
@@ -227,7 +227,11 @@ def make_auc_timecourse_plot(
     if not has_trace:
         return None
 
-    y_axis_title = "Cortisol (nmol/L)" if metric == "AUCg" else "Cortisol above baseline (nmol/L)"
+    y_axis_title = (
+        "Cortisol (nmol/L)"
+        if metric_key == "AUCG"
+        else "Cortisol above baseline (nmol/L)"
+    )
     fig.update_layout(
         xaxis=dict(
             title="Time (minutes)",
