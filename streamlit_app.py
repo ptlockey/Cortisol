@@ -193,6 +193,55 @@ def make_line_plot(summary_df: pd.DataFrame, groups: List[str], phases: List[str
     return fig
 
 
+def make_auc_timecourse_plot(
+    summary_df: pd.DataFrame, groups: List[str], phases: List[str], metric: str
+) -> go.Figure | None:
+    """Create an area plot that visualises the AUC curves for the selections."""
+
+    metric = metric.upper()
+    if metric not in {"AUCg", "AUCi"}:
+        raise ValueError("metric must be either 'AUCg' or 'AUCi'")
+
+    fig = go.Figure()
+    has_trace = False
+    for group in groups:
+        for phase in phases:
+            subset = summary_df[(summary_df.group == group) & (summary_df.phase == phase)]
+            if subset.empty:
+                continue
+            y_values = subset["mean"].to_numpy()
+            baseline = y_values[0] if len(y_values) else np.nan
+            if metric == "AUCI":
+                y_values = y_values - baseline
+            fig.add_trace(
+                go.Scatter(
+                    x=subset["time"],
+                    y=y_values,
+                    mode="lines+markers",
+                    fill="tozeroy",
+                    name=f"{group} {phase}",
+                )
+            )
+            has_trace = True
+
+    if not has_trace:
+        return None
+
+    y_axis_title = "Cortisol (nmol/L)" if metric == "AUCg" else "Cortisol above baseline (nmol/L)"
+    fig.update_layout(
+        xaxis=dict(
+            title="Time (minutes)",
+            tickmode="array",
+            tickvals=list(TIME_POINTS),
+        ),
+        yaxis=dict(title=y_axis_title, dtick=5),
+        template="plotly_white",
+        legend_title="Condition",
+        hovermode="x unified",
+    )
+    return fig
+
+
 def main() -> None:
     st.set_page_config(page_title="Cortisol analysis dashboard", layout="wide")
     st.title("Cortisol time-course analysis")
@@ -240,6 +289,19 @@ def main() -> None:
     if auc_df.empty:
         st.warning("Not enough complete cases to compute AUC metrics.")
         return
+
+    st.markdown("### AUC visualisations")
+    if selected_groups and selected_phases:
+        tabs = st.tabs(["AUCg", "AUCi"])
+        for metric, tab in zip(["AUCg", "AUCi"], tabs):
+            with tab:
+                auc_figure = make_auc_timecourse_plot(summary_df, selected_groups, selected_phases, metric)
+                if auc_figure is None:
+                    st.info("No data available for the selected combination.")
+                else:
+                    st.plotly_chart(auc_figure, use_container_width=True)
+    else:
+        st.info("Select at least one group and phase to display the AUC plots.")
 
     summary_auc, p_values = summarise_auc(auc_df)
     table = reshape_auc_summary(summary_auc, p_values)
