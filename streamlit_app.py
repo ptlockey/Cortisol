@@ -33,6 +33,10 @@ def load_data() -> pd.DataFrame:
     df = pd.read_excel("Cortisol.xlsx")
     df.columns = df.columns.str.strip()
     df["GroupLabel"] = df["Group"].map(GROUP_LABELS).fillna(df["Group"].astype(str))
+    for candidate in ("Participant", "Ppt ID", "ID"):
+        if candidate in df.columns:
+            df["Participant"] = df[candidate]
+            break
     return df
 
 
@@ -45,7 +49,10 @@ def apply_log_transform(df: pd.DataFrame) -> pd.DataFrame:
     ]
     for column in value_columns:
         if column in transformed:
-            transformed[column] = np.log(transformed[column].clip(lower=0.01))
+            numeric = pd.to_numeric(transformed[column], errors="coerce")
+            with np.errstate(divide="ignore"):
+                log_values = np.where(numeric > 0, np.log(numeric), np.nan)
+            transformed[column] = pd.Series(log_values, index=transformed.index)
     return transformed
 
 
@@ -193,13 +200,109 @@ def make_line_plot(summary_df: pd.DataFrame, groups: List[str], phases: List[str
     return fig
 
 
+def make_baseline_distribution_plot(
+    df: pd.DataFrame, groups: List[str], phases: List[str]
+) -> go.Figure | None:
+    """Display individual baseline measurements for the selected groups/phases."""
+
+    phase_columns = {"Baseline": "B0 nmol/l", "Post": "P0 nmol/l"}
+    available_phases = [phase for phase in phases if phase in phase_columns]
+    fig = go.Figure()
+    has_trace = False
+
+    for phase in available_phases:
+        column = phase_columns[phase]
+        if column not in df:
+            continue
+        for group in groups:
+            subset = df[df["GroupLabel"] == group]
+            if subset.empty:
+                continue
+            values = pd.to_numeric(subset[column], errors="coerce").dropna()
+            if values.empty:
+                continue
+            fig.add_trace(
+                go.Box(
+                    y=values,
+                    name=f"{group} {phase}",
+                    boxpoints="all",
+                    jitter=0.4,
+                    pointpos=0,
+                    marker=dict(size=6),
+                )
+            )
+            has_trace = True
+
+    if not has_trace:
+        return None
+
+    fig.update_layout(
+        xaxis_title="Condition",
+        yaxis_title="Cortisol (nmol/L)",
+        template="plotly_white",
+        hovermode="closest",
+        showlegend=False,
+    )
+    return fig
+
+
+def make_individual_timecourse_plot(
+    df: pd.DataFrame, participant: str | None, phases: List[str]
+) -> go.Figure | None:
+    """Visualise an individual's cortisol trajectory across the selected phases."""
+
+    if not participant or "Participant" not in df:
+        return None
+
+    subset = df[df["Participant"] == participant]
+    if subset.empty:
+        return None
+
+    row = subset.iloc[0]
+    fig = go.Figure()
+    has_trace = False
+    for phase in phases:
+        prefix = PHASE_PREFIXES.get(phase)
+        if not prefix:
+            continue
+        columns = [f"{prefix}{t} nmol/l" for t in TIME_POINTS if f"{prefix}{t} nmol/l" in df]
+        if not columns:
+            continue
+        values = pd.to_numeric(row[columns], errors="coerce")
+        if values.isna().all():
+            continue
+        times = [int(col.split()[0][1:]) for col in columns]
+        fig.add_trace(
+            go.Scatter(x=times, y=values, mode="lines+markers", name=phase)
+        )
+        has_trace = True
+
+    if not has_trace:
+        return None
+
+    group_label = row.get("GroupLabel", row.get("Group", ""))
+    fig.update_layout(
+        title=f"{participant} ({group_label})" if group_label else participant,
+        xaxis=dict(
+            title="Time (minutes)",
+            tickmode="array",
+            tickvals=list(TIME_POINTS),
+        ),
+        yaxis=dict(title="Cortisol (nmol/L)", dtick=5),
+        template="plotly_white",
+        legend_title="Phase",
+        hovermode="x unified",
+    )
+    return fig
+
+
 def make_auc_timecourse_plot(
     summary_df: pd.DataFrame, groups: List[str], phases: List[str], metric: str
 ) -> go.Figure | None:
     """Create an area plot that visualises the AUC curves for the selections."""
 
-    metric = metric.upper()
-    if metric not in {"AUCg", "AUCi"}:
+    metric_key = metric.strip().upper()
+    if metric_key not in {"AUCG", "AUCI"}:
         raise ValueError("metric must be either 'AUCg' or 'AUCi'")
 
     fig = go.Figure()
@@ -211,7 +314,7 @@ def make_auc_timecourse_plot(
                 continue
             y_values = subset["mean"].to_numpy()
             baseline = y_values[0] if len(y_values) else np.nan
-            if metric == "AUCI":
+            if metric_key == "AUCI":
                 y_values = y_values - baseline
             fig.add_trace(
                 go.Scatter(
@@ -227,7 +330,11 @@ def make_auc_timecourse_plot(
     if not has_trace:
         return None
 
-    y_axis_title = "Cortisol (nmol/L)" if metric == "AUCg" else "Cortisol above baseline (nmol/L)"
+    y_axis_title = (
+        "Cortisol (nmol/L)"
+        if metric_key == "AUCG"
+        else "Cortisol above baseline (nmol/L)"
+    )
     fig.update_layout(
         xaxis=dict(
             title="Time (minutes)",
@@ -269,6 +376,23 @@ def main() -> None:
         selected_phases = st.multiselect(
             "Phases", options=available_phases, default=available_phases
         )
+        group_filtered = (
+            raw_df[raw_df["GroupLabel"].isin(selected_groups)]
+            if selected_groups
+            else raw_df
+        )
+        participant_options = (
+            sorted(group_filtered["Participant"].dropna().unique().tolist())
+            if "Participant" in group_filtered
+            else []
+        )
+        if participant_options:
+            selected_participant = st.selectbox(
+                "Individual", options=participant_options
+            )
+        else:
+            selected_participant = None
+            st.caption("No participants available for the current group selection.")
 
     st.subheader("Raw data preview")
     st.dataframe(df.head())
@@ -283,6 +407,29 @@ def main() -> None:
         st.plotly_chart(figure, use_container_width=True)
     else:
         st.info("Select at least one group and phase to display the line plot.")
+
+    st.subheader("Baseline cortisol (individual measurements)")
+    if selected_groups and selected_phases:
+        baseline_fig = make_baseline_distribution_plot(raw_df, selected_groups, selected_phases)
+        if baseline_fig is None:
+            st.info("No baseline measurements available for the selected combination.")
+        else:
+            st.plotly_chart(baseline_fig, use_container_width=True)
+    else:
+        st.info("Select at least one group and phase to display the baseline plot.")
+
+    st.subheader("Individual trajectories")
+    if selected_groups and selected_phases and selected_participant:
+        individual_fig = make_individual_timecourse_plot(df, selected_participant, selected_phases)
+        if individual_fig is None:
+            st.info("No time-course data available for the selected individual.")
+        else:
+            st.plotly_chart(individual_fig, use_container_width=True)
+    else:
+        if not selected_groups or not selected_phases:
+            st.info("Select at least one group and phase to display the individual trajectory.")
+        else:
+            st.info("Select a participant with available measurements to display their trajectory.")
 
     st.subheader("Area under the curve metrics")
     auc_df = compute_auc(df)
