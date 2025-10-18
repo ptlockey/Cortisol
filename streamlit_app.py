@@ -187,7 +187,11 @@ def make_line_plot(summary_df: pd.DataFrame, groups: List[str], phases: List[str
                 )
             )
     fig.update_layout(
-        xaxis_title="Time (minutes)",
+        xaxis=dict(
+            title="Time (minutes)",
+            tickmode="array",
+            tickvals=list(TIME_POINTS),
+        ),
         yaxis_title="Cortisol (nmol/L)",
         template="plotly_white",
         legend_title="Condition",
