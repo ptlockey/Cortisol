@@ -35,6 +35,8 @@ def load_data() -> pd.DataFrame:
     df = pd.read_excel("Cortisol.xlsx")
     df.columns = df.columns.str.strip()
     df["GroupLabel"] = df["Group"].map(GROUP_LABELS).fillna(df["Group"].astype(str))
+    if "Ppt ID" in df.columns:
+        df["Cohort"] = df["Ppt ID"].astype(str).str.extract(r"^(C\d)")
     return df
 
 
@@ -164,15 +166,22 @@ def reshape_auc_summary(summary: pd.DataFrame, p_values: pd.DataFrame) -> pd.Dat
     return table.sort_values(["Metric", "Phase"]).reset_index(drop=True)
 
 
-def make_line_plot(summary_df: pd.DataFrame, groups: List[str], phases: List[str]) -> go.Figure:
+def make_line_plot(
+    summary_df: pd.DataFrame, groups: List[str], phases: List[str], use_log_scale: bool
+) -> go.Figure:
     """Create a line plot with mean ± SD whiskers for each selection."""
 
     fig = go.Figure()
+    max_whisker = None
     for group in groups:
         for phase in phases:
             subset = summary_df[(summary_df.group == group) & (summary_df.phase == phase)]
             if subset.empty:
                 continue
+            if not use_log_scale and "mean" in subset and "sd" in subset:
+                whisker = (subset["mean"] + subset["sd"]).max()
+                if pd.notna(whisker):
+                    max_whisker = max(whisker, max_whisker or whisker)
             line_dash = "solid" if phase == "Post" else "dash"
             fig.add_trace(
                 go.Scatter(
@@ -188,18 +197,44 @@ def make_line_plot(summary_df: pd.DataFrame, groups: List[str], phases: List[str
                     line=dict(dash=line_dash),
                 )
             )
+
+    y_axis_title = "Log cortisol (ln(nmol/L))" if use_log_scale else "Cortisol (nmol/L)"
+    yaxis_config = _build_cortisol_axis_config(
+        max_whisker, use_log_scale=use_log_scale, axis_title=y_axis_title
+    )
+
     fig.update_layout(
         xaxis=dict(
             title="Time (minutes)",
             tickmode="array",
             tickvals=list(TIME_POINTS),
         ),
-        yaxis_title="Cortisol (nmol/L)",
+        yaxis=yaxis_config,
         template="plotly_white",
         legend_title="Condition",
         hovermode="x unified",
     )
     return fig
+
+
+def _build_cortisol_axis_config(
+    max_value: float | None,
+    *,
+    use_log_scale: bool = False,
+    axis_title: str | None = None,
+) -> Dict[str, object]:
+    """Return a consistent axis configuration for cortisol visualisations."""
+
+    title = axis_title or ("Log cortisol (ln(nmol/L))" if use_log_scale else "Cortisol (nmol/L)")
+    config: Dict[str, object] = {"title": title}
+    if use_log_scale:
+        return config
+
+    config.update({"rangemode": "tozero", "tick0": 0, "dtick": 5})
+    if max_value is not None and np.isfinite(max_value):
+        padding = max(0.5, max_value * 0.05)
+        config["range"] = [0, max_value + padding]
+    return config
 
 
 def make_baseline_distribution_plot(
@@ -211,6 +246,7 @@ def make_baseline_distribution_plot(
     available_phases = [phase for phase in phases if phase in phase_columns]
     fig = go.Figure()
     has_trace = False
+    max_value = None
 
     for phase in available_phases:
         column = phase_columns[phase]
@@ -223,6 +259,9 @@ def make_baseline_distribution_plot(
             values = pd.to_numeric(subset[column], errors="coerce").dropna()
             if values.empty:
                 continue
+            candidate = values.max()
+            if pd.notna(candidate):
+                max_value = max(candidate, max_value or candidate)
             fig.add_trace(
                 go.Box(
                     y=values,
@@ -240,9 +279,69 @@ def make_baseline_distribution_plot(
 
     fig.update_layout(
         xaxis_title="Condition",
-        yaxis_title="Cortisol (nmol/L)",
+        yaxis=_build_cortisol_axis_config(max_value),
         template="plotly_white",
         hovermode="closest",
+        showlegend=False,
+    )
+    return fig
+
+
+def make_timepoint_distribution_plot(
+    df: pd.DataFrame,
+    groups: List[str],
+    phase: str,
+    *,
+    use_log_scale: bool,
+) -> go.Figure | None:
+    """Show individual measurements for every time point within a phase."""
+
+    prefix = PHASE_PREFIXES.get(phase)
+    if prefix is None:
+        return None
+
+    fig = go.Figure()
+    has_trace = False
+    max_value = None
+
+    for group in groups:
+        subset = df[df["GroupLabel"] == group]
+        if subset.empty:
+            continue
+        for time_point in TIME_POINTS:
+            column = f"{prefix}{time_point} nmol/l"
+            if column not in subset:
+                continue
+            values = pd.to_numeric(subset[column], errors="coerce").dropna()
+            if values.empty:
+                continue
+            candidate = values.max()
+            if pd.notna(candidate):
+                max_value = max(candidate, max_value or candidate)
+            fig.add_trace(
+                go.Box(
+                    y=values,
+                    name=f"{group} {time_point} min",
+                    boxpoints="all",
+                    boxmean=True,
+                    jitter=0.4,
+                    pointpos=0,
+                    marker=dict(size=6),
+                )
+            )
+            has_trace = True
+
+    if not has_trace:
+        return None
+
+    axis_title = "Log cortisol (ln(nmol/L))" if use_log_scale else "Cortisol (nmol/L)"
+    fig.update_layout(
+        title=f"{phase} Individual Values in Relation to Mean of Group",
+        xaxis_title="Group and time point",
+        yaxis=_build_cortisol_axis_config(
+            max_value, use_log_scale=use_log_scale, axis_title=axis_title
+        ),
+        template="plotly_white",
         showlegend=False,
     )
     return fig
@@ -259,15 +358,17 @@ def make_auc_timecourse_plot(
 
     fig = go.Figure()
     has_trace = False
+    max_value = None
     for group in groups:
         for phase in phases:
             subset = summary_df[(summary_df.group == group) & (summary_df.phase == phase)]
             if subset.empty:
                 continue
             y_values = subset["mean"].to_numpy()
-            baseline = y_values[0] if len(y_values) else np.nan
-            if metric_key == "AUCI":
-                y_values = y_values - baseline
+            if len(y_values):
+                candidate = np.nanmax(y_values)
+                if np.isfinite(candidate):
+                    max_value = candidate if max_value is None else max(max_value, candidate)
             fig.add_trace(
                 go.Scatter(
                     x=subset["time"],
@@ -287,13 +388,15 @@ def make_auc_timecourse_plot(
         if metric_key == "AUCG"
         else "Cortisol change from baseline (nmol/L)"
     )
-    yaxis_config = dict(title=y_axis_title)
     if metric_key == "AUCG":
-        yaxis_config["rangemode"] = "tozero"
+        yaxis_config = _build_cortisol_axis_config(max_value, axis_title=y_axis_title)
     else:
-        yaxis_config["zeroline"] = True
-        yaxis_config["zerolinecolor"] = "#999999"
-        yaxis_config["zerolinewidth"] = 1
+        yaxis_config = dict(
+            title=y_axis_title,
+            zeroline=True,
+            zerolinecolor="#999999",
+            zerolinewidth=1,
+        )
 
     fig.update_layout(
         xaxis=dict(
@@ -350,9 +453,18 @@ def make_participant_timecourse_plot(
     if not has_trace:
         return None
 
-    yaxis_config = dict(title=y_axis_title)
-    if force_zero_start:
-        yaxis_config["rangemode"] = "tozero"
+    max_value = None
+    for trace in fig.data:
+        y_data = trace["y"]
+        if y_data is None:
+            continue
+        candidate = np.nanmax(y_data)
+        if np.isfinite(candidate):
+            max_value = candidate if max_value is None else max(max_value, candidate)
+
+    yaxis_config = _build_cortisol_axis_config(
+        max_value, use_log_scale=not force_zero_start, axis_title=y_axis_title
+    )
 
     fig.update_layout(
         xaxis=dict(
@@ -392,6 +504,7 @@ def make_group_spaghetti_plot(
 
     fig = go.Figure()
     has_trace = False
+    max_value = None
 
     for (group, phase), colour in colour_map.items():
         phase_subset = filtered[filtered["GroupLabel"] == group]
@@ -403,6 +516,10 @@ def make_group_spaghetti_plot(
             if not times:
                 continue
             participant_label = row.get(participant_column, "Unknown")
+            if values:
+                candidate = max(values)
+                if max_value is None or candidate > max_value:
+                    max_value = candidate
             fig.add_trace(
                 go.Scatter(
                     x=times,
@@ -430,6 +547,10 @@ def make_group_spaghetti_plot(
             (summary_df.group == group) & (summary_df.phase == phase)
         ]
         if not summary_subset.empty:
+            if {"mean", "sd"}.issubset(summary_subset.columns):
+                whisker = (summary_subset["mean"] + summary_subset["sd"]).max()
+                if pd.notna(whisker):
+                    max_value = max(whisker, max_value or whisker)
             fig.add_trace(
                 go.Scatter(
                     x=summary_subset["time"],
@@ -461,7 +582,7 @@ def make_group_spaghetti_plot(
             tickmode="array",
             tickvals=list(TIME_POINTS),
         ),
-        yaxis=dict(title="Cortisol (nmol/L)", rangemode="tozero"),
+        yaxis=_build_cortisol_axis_config(max_value),
         template="plotly_white",
         legend_title="Condition",
         hovermode="x unified",
@@ -485,46 +606,79 @@ def make_individual_auc_plot(
         return None
 
     fig = go.Figure()
-    for phase in phases:
-        phase_subset = subset[subset["Phase"] == phase]
-        if phase_subset.empty:
-            continue
-        for group in groups:
-            group_subset = phase_subset[phase_subset["Group"] == group]
-            if group_subset.empty:
-                continue
-            fig.add_trace(
-                go.Box(
-                    y=group_subset["Value"],
-                    name=f"{group} {phase}",
-                    boxpoints="all",
-                    jitter=0.4,
-                    pointpos=0,
-                    marker=dict(size=6),
-                    customdata=np.array(
-                        group_subset["Participant"].astype(str).to_numpy().reshape(-1, 1)
-                    ),
-                    hovertemplate=(
-                        "Group: "
-                        + group
-                        + "<br>Phase: "
-                        + phase
-                        + "<br>Participant: %{customdata[0]}"
-                        + "<br>AUC: %{y:.2f}"
-                        + "<extra></extra>"
-                    ),
-                )
+    max_value = None
+    min_value = None
+    colour_cycle = cycle(plotly_colors.qualitative.Set2)
+    group_colours = {group: next(colour_cycle) for group in groups} if groups else {}
+
+    phase_order = {phase: index for index, phase in enumerate(sorted(phases))}
+    category_values = [
+        f"{group} {phase}"
+        for phase in phases
+        for group in groups
+        if ((subset["Group"] == group) & (subset["Phase"] == phase)).any()
+    ]
+
+    for participant, participant_df in subset.groupby("Participant"):
+        participant_df = participant_df.sort_values(
+            "Phase", key=lambda col: col.map(phase_order).fillna(len(phase_order))
+        )
+        x_values = [f"{row['Group']} {row['Phase']}" for _, row in participant_df.iterrows()]
+        y_values = participant_df["Value"].to_numpy()
+        if y_values.size:
+            candidate_max = np.nanmax(y_values)
+            candidate_min = np.nanmin(y_values)
+            if np.isfinite(candidate_max):
+                max_value = candidate_max if max_value is None else max(max_value, candidate_max)
+            if np.isfinite(candidate_min):
+                min_value = candidate_min if min_value is None else min(min_value, candidate_min)
+        group_label = participant_df["Group"].iloc[0] if not participant_df.empty else ""
+        colour = group_colours.get(group_label, next(colour_cycle))
+        fig.add_trace(
+            go.Scatter(
+                x=x_values,
+                y=y_values,
+                mode="lines+markers",
+                name=f"{participant} ({group_label})",
+                marker=dict(color=colour),
+                line=dict(color=colour),
+                hovertemplate=(
+                    "Participant: "
+                    + str(participant)
+                    + "<br>Group: "
+                    + str(group_label)
+                    + "<br>Phase: %{x}"
+                    + "<br>AUC: %{y:.2f}"
+                    + "<extra></extra>"
+                ),
             )
+        )
 
     yaxis_title = "AUC (nmol/L × min)" if metric_key == "AUCG" else "AUC increase (nmol/L × min)"
     yaxis_config = dict(title=yaxis_title)
     if metric_key == "AUCG":
         yaxis_config["rangemode"] = "tozero"
+        if max_value is not None and np.isfinite(max_value):
+            padding = max(5.0, max_value * 0.05)
+            yaxis_config["range"] = [0, max_value + padding]
+    else:
+        if min_value is not None and max_value is not None and np.isfinite(min_value) and np.isfinite(max_value):
+            padding = max(5.0, (max_value - min_value) * 0.05)
+            yaxis_config["range"] = [min_value - padding, max_value + padding]
+        yaxis_config.update(
+            zeroline=True,
+            zerolinecolor="#999999",
+            zerolinewidth=1,
+        )
 
     fig.update_layout(
         template="plotly_white",
-        showlegend=False,
-        xaxis_title="Group / Phase",
+        legend_title="Participant",
+        xaxis=dict(
+            title="Group and phase",
+            categoryorder="array",
+            categoryarray=category_values,
+        ),
         yaxis=yaxis_config,
     )
     return fig
@@ -554,6 +708,7 @@ def make_phase_overlay_plot(
     colour_cycle = cycle(plotly_colors.qualitative.Dark24)
     fig = go.Figure()
     has_trace = False
+    max_value = None
 
     for _, row in filtered.iterrows():
         times, values = _extract_phase_timecourse(row, phase)
@@ -562,6 +717,10 @@ def make_phase_overlay_plot(
         participant = row.get(participant_column, "Unknown")
         group = row.get("GroupLabel", "Unknown")
         colour = next(colour_cycle)
+        if values:
+            candidate = max(values)
+            if max_value is None or candidate > max_value:
+                max_value = candidate
         fig.add_trace(
             go.Scatter(
                 x=times,
@@ -587,9 +746,7 @@ def make_phase_overlay_plot(
         return None
 
     y_axis_title = "Log cortisol (ln(nmol/L))" if use_log_scale else "Cortisol (nmol/L)"
-    yaxis_config = dict(title=y_axis_title)
-    if not use_log_scale:
-        yaxis_config["rangemode"] = "tozero"
+    yaxis_config = _build_cortisol_axis_config(max_value, use_log_scale=use_log_scale, axis_title=y_axis_title)
 
     fig.update_layout(
         title=f"{phase} cortisol trajectories",
@@ -638,13 +795,25 @@ def main() -> None:
         selected_phases = st.multiselect(
             "Phases", options=available_phases, default=available_phases
         )
+        available_cohorts = (
+            sorted(df["Cohort"].dropna().unique().tolist()) if "Cohort" in df.columns else []
+        )
+        selected_cohorts = (
+            st.multiselect("Cohorts", options=available_cohorts, default=available_cohorts)
+            if available_cohorts
+            else []
+        )
         if participant_column:
-            participant_df = df[[participant_column, "GroupLabel"]].dropna(
+            participant_df = df[[participant_column, "GroupLabel", "Cohort"]].dropna(
                 subset=[participant_column]
             )
             if selected_groups:
                 participant_df = participant_df[
                     participant_df["GroupLabel"].isin(selected_groups)
+                ]
+            if selected_cohorts:
+                participant_df = participant_df[
+                    participant_df["Cohort"].isin(selected_cohorts)
                 ]
             participant_df = participant_df.drop_duplicates().sort_values(
                 ["GroupLabel", participant_column]
@@ -663,17 +832,26 @@ def main() -> None:
             st.caption("No participant identifier found in the dataset.")
             selected_participants = []
 
+    filtered_df = df.copy()
+    filtered_raw_df = raw_df.copy()
+    if selected_groups:
+        filtered_df = filtered_df[filtered_df["GroupLabel"].isin(selected_groups)]
+        filtered_raw_df = filtered_raw_df[filtered_raw_df["GroupLabel"].isin(selected_groups)]
+    if selected_cohorts:
+        filtered_df = filtered_df[filtered_df["Cohort"].isin(selected_cohorts)]
+        filtered_raw_df = filtered_raw_df[filtered_raw_df["Cohort"].isin(selected_cohorts)]
+
     st.subheader("Raw data preview")
-    st.dataframe(df.head())
+    st.dataframe(filtered_df.head())
 
     st.subheader("Means and standard deviations by time point")
-    summary_df = summarise_time_points(df)
-    raw_summary_df = summarise_time_points(raw_df)
+    summary_df = summarise_time_points(filtered_df)
+    raw_summary_df = summarise_time_points(filtered_raw_df)
     st.dataframe(summary_df)
 
     st.subheader("Cortisol trajectory")
     if selected_groups and selected_phases:
-        figure = make_line_plot(summary_df, selected_groups, selected_phases)
+        figure = make_line_plot(summary_df, selected_groups, selected_phases, use_log)
         st.plotly_chart(figure, use_container_width=True)
     else:
         st.info("Select at least one group and phase to display the line plot.")
@@ -686,7 +864,11 @@ def main() -> None:
         and not raw_df.empty
     ):
         spaghetti_fig = make_group_spaghetti_plot(
-            raw_df, raw_summary_df, participant_column, selected_groups, selected_phases
+            filtered_raw_df,
+            raw_summary_df,
+            participant_column,
+            selected_groups,
+            selected_phases,
         )
         if spaghetti_fig is None:
             st.info(
@@ -704,21 +886,29 @@ def main() -> None:
             " to display the group trajectory plot."
         )
 
-    st.subheader("Baseline cortisol (individual measurements)")
+    st.subheader("Individual Values in Relation to Mean of Group")
     if selected_groups and selected_phases:
-        baseline_fig = make_baseline_distribution_plot(raw_df, selected_groups, selected_phases)
-        if baseline_fig is None:
-            st.info("No baseline measurements available for the selected combination.")
-        else:
-            st.plotly_chart(baseline_fig, use_container_width=True)
+        for phase in selected_phases:
+            distribution_fig = make_timepoint_distribution_plot(
+                filtered_df if use_log else filtered_raw_df,
+                selected_groups,
+                phase,
+                use_log_scale=use_log,
+            )
+            if distribution_fig is None:
+                st.info(
+                    f"No cortisol measurements available for the {phase.lower()} phase with the current selections."
+                )
+            else:
+                st.plotly_chart(distribution_fig, use_container_width=True)
     else:
-        st.info("Select at least one group and phase to display the baseline plot.")
+        st.info("Select at least one group and phase to display the distribution plots.")
 
     st.subheader("Participant overlays by phase")
     if participant_column and selected_groups and selected_phases:
         for phase in selected_phases:
             overlay_fig = make_phase_overlay_plot(
-                df, participant_column, selected_groups, phase, use_log
+                filtered_df, participant_column, selected_groups, phase, use_log
             )
             if overlay_fig is None:
                 st.info(
@@ -745,7 +935,7 @@ def main() -> None:
             for participant in selected_participants:
                 display_label = participant_labels.get(participant, str(participant))
                 st.markdown(f"#### {display_label}")
-                participant_rows = df[df[participant_column] == participant]
+                participant_rows = filtered_df[filtered_df[participant_column] == participant]
                 if participant_rows.empty:
                     st.warning("No data available for this participant.")
                     continue
@@ -760,7 +950,7 @@ def main() -> None:
                     st.plotly_chart(figure, use_container_width=True)
 
     st.subheader("Area under the curve metrics")
-    auc_df = compute_auc(df)
+    auc_df = compute_auc(filtered_df)
     if auc_df.empty:
         st.warning("Not enough complete cases to compute AUC metrics.")
         return
