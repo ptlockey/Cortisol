@@ -1,0 +1,53 @@
+:root {
+  color-scheme: light dark;
+  font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+}
+
+.editor-container {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 0.75rem;
+  min-height: 600px;
+  background: var(--editor-background, #f7f7f7);
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.toolbar button {
+  border-radius: 6px;
+  border: 1px solid rgba(0, 0, 0, 0.2);
+  padding: 0.3rem 0.6rem;
+  cursor: pointer;
+  background: #ffffff;
+  font-size: 0.85rem;
+}
+
+.toolbar button.active {
+  background: #0052cc;
+  color: #ffffff;
+  border-color: #0052cc;
+}
+
+.canvas-wrapper {
+  position: relative;
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  border-radius: 8px;
+  background: #ffffff;
+  overflow: hidden;
+}
+
+.annotation {
+  font-size: 0.75rem;
+  color: rgba(0, 0, 0, 0.6);
+}

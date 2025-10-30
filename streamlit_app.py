@@ -1,9 +1,12 @@
 """Streamlit application for exploring cortisol time-course data."""
 from __future__ import annotations
 
+import json
+import math
 from dataclasses import dataclass
-from itertools import cycle
-from typing import Dict, Iterable, List, Tuple
+from itertools import combinations, cycle
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -11,10 +14,291 @@ import plotly.graph_objects as go
 from plotly import colors as plotly_colors
 import streamlit as st
 from scipy import stats
+from jsonschema import Draft7Validator, ValidationError
+
+from floorplan_component import floorplan_editor
 
 TIME_POINTS: Tuple[int, ...] = (0, 15, 30, 45)
 PHASE_PREFIXES: Dict[str, str] = {"Baseline": "B", "Post": "P"}
 GROUP_LABELS: Dict[int, str] = {1: "MBLC", 2: "Control"}
+
+SCHEMATIC_VERSION = "1.0.0"
+SCHEMATIC_STATE_PATH = Path("floorplan_state.json")
+MIN_WALL_LENGTH = 30.0
+GEOMETRY_TOLERANCE = 1e-6
+
+FLOORPLAN_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "required": ["version", "walls", "rooms"],
+    "properties": {
+        "version": {"type": "string"},
+        "metadata": {"type": "object"},
+        "walls": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["id", "start", "end", "thickness"],
+                "properties": {
+                    "id": {"type": "string"},
+                    "name": {"type": "string"},
+                    "start": {
+                        "type": "object",
+                        "required": ["x", "y"],
+                        "properties": {
+                            "x": {"type": "number"},
+                            "y": {"type": "number"},
+                        },
+                    },
+                    "end": {
+                        "type": "object",
+                        "required": ["x", "y"],
+                        "properties": {
+                            "x": {"type": "number"},
+                            "y": {"type": "number"},
+                        },
+                    },
+                    "thickness": {"type": "number", "minimum": 1},
+                    "material": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
+        "rooms": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["id", "name", "walls"],
+                "properties": {
+                    "id": {"type": "string"},
+                    "name": {"type": "string"},
+                    "walls": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                    },
+                    "metadata": {"type": "object"},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    "additionalProperties": True,
+}
+
+FLOORPLAN_VALIDATOR = Draft7Validator(FLOORPLAN_SCHEMA)
+
+DEFAULT_SCHEMATIC: Dict[str, Any] = {
+    "version": SCHEMATIC_VERSION,
+    "metadata": {
+        "title": "Baseline laboratory layout",
+        "description": "Rectangular template to start room annotations",
+    },
+    "walls": [
+        {
+            "id": "wall-1",
+            "name": "North wall",
+            "start": {"x": 120.0, "y": 120.0},
+            "end": {"x": 480.0, "y": 120.0},
+            "thickness": 14.0,
+        },
+        {
+            "id": "wall-2",
+            "name": "East wall",
+            "start": {"x": 480.0, "y": 120.0},
+            "end": {"x": 480.0, "y": 360.0},
+            "thickness": 14.0,
+        },
+        {
+            "id": "wall-3",
+            "name": "South wall",
+            "start": {"x": 480.0, "y": 360.0},
+            "end": {"x": 120.0, "y": 360.0},
+            "thickness": 14.0,
+        },
+        {
+            "id": "wall-4",
+            "name": "West wall",
+            "start": {"x": 120.0, "y": 360.0},
+            "end": {"x": 120.0, "y": 120.0},
+            "thickness": 14.0,
+        },
+    ],
+    "rooms": [
+        {
+            "id": "room-1",
+            "name": "Observation suite",
+            "walls": ["wall-1", "wall-2", "wall-3", "wall-4"],
+            "metadata": {"notes": "Update this template to reflect your lab."},
+        }
+    ],
+}
+
+
+def _coerce_point(candidate: Any) -> Dict[str, float]:
+    """Return a point mapping with numeric coordinates."""
+
+    if isinstance(candidate, dict):
+        try:
+            x = float(candidate["x"])
+            y = float(candidate["y"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Point dictionaries must contain numeric 'x' and 'y' values") from exc
+        return {"x": x, "y": y}
+    if isinstance(candidate, (list, tuple)) and len(candidate) == 2:
+        try:
+            x, y = (float(candidate[0]), float(candidate[1]))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Point sequences must contain numeric coordinates") from exc
+        return {"x": x, "y": y}
+    raise ValueError("Points must be dictionaries with 'x'/'y' or a two-value sequence")
+
+
+def normalise_floorplan(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Return a deep-copied floorplan that conforms to the JSON schema."""
+
+    if not raw:
+        return json.loads(json.dumps(DEFAULT_SCHEMATIC))
+
+    serialised = json.loads(json.dumps(raw))
+    serialised.setdefault("version", SCHEMATIC_VERSION)
+    serialised.setdefault("metadata", {})
+
+    walls: List[Dict[str, Any]] = []
+    for wall in serialised.get("walls", []):
+        wall_id = str(wall.get("id", "")).strip()
+        if not wall_id:
+            raise ValueError("Each wall requires a non-empty 'id'.")
+        start = _coerce_point(wall.get("start"))
+        end = _coerce_point(wall.get("end"))
+        thickness = wall.get("thickness", 10.0)
+        try:
+            thickness_value = float(thickness)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Wall '{wall_id}' thickness must be numeric.") from exc
+        wall_entry: Dict[str, Any] = {
+            "id": wall_id,
+            "name": wall.get("name", wall_id),
+            "start": start,
+            "end": end,
+            "thickness": thickness_value,
+        }
+        material = wall.get("material")
+        if isinstance(material, str) and material.strip():
+            wall_entry["material"] = material
+        walls.append(wall_entry)
+    serialised["walls"] = walls
+
+    rooms: List[Dict[str, Any]] = []
+    for room in serialised.get("rooms", []):
+        room_id = str(room.get("id", "")).strip()
+        if not room_id:
+            raise ValueError("Each room requires a non-empty 'id'.")
+        name = room.get("name") or room_id
+        wall_refs = [str(identifier) for identifier in room.get("walls", [])]
+        metadata = room.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {"notes": str(metadata)}
+        rooms.append({
+            "id": room_id,
+            "name": name,
+            "walls": wall_refs,
+            "metadata": metadata,
+        })
+    serialised["rooms"] = rooms
+
+    FLOORPLAN_VALIDATOR.validate(serialised)
+    return serialised
+
+
+def _points_close(a: Dict[str, float], b: Dict[str, float]) -> bool:
+    return math.isclose(a["x"], b["x"], abs_tol=GEOMETRY_TOLERANCE) and math.isclose(
+        a["y"], b["y"], abs_tol=GEOMETRY_TOLERANCE
+    )
+
+
+def _orientation(p: Dict[str, float], q: Dict[str, float], r: Dict[str, float]) -> int:
+    value = (q["y"] - p["y"]) * (r["x"] - q["x"]) - (q["x"] - p["x"]) * (r["y"] - q["y"])
+    if abs(value) <= GEOMETRY_TOLERANCE:
+        return 0
+    return 1 if value > 0 else 2
+
+
+def _on_segment(p: Dict[str, float], q: Dict[str, float], r: Dict[str, float]) -> bool:
+    return (
+        min(p["x"], r["x"]) - GEOMETRY_TOLERANCE <= q["x"] <= max(p["x"], r["x"]) + GEOMETRY_TOLERANCE
+        and min(p["y"], r["y"]) - GEOMETRY_TOLERANCE <= q["y"] <= max(p["y"], r["y"]) + GEOMETRY_TOLERANCE
+    )
+
+
+def _segments_intersect(
+    a_start: Dict[str, float], a_end: Dict[str, float], b_start: Dict[str, float], b_end: Dict[str, float]
+) -> bool:
+    o1 = _orientation(a_start, a_end, b_start)
+    o2 = _orientation(a_start, a_end, b_end)
+    o3 = _orientation(b_start, b_end, a_start)
+    o4 = _orientation(b_start, b_end, a_end)
+
+    if o1 != o2 and o3 != o4:
+        return True
+    if o1 == 0 and _on_segment(a_start, b_start, a_end):
+        return True
+    if o2 == 0 and _on_segment(a_start, b_end, a_end):
+        return True
+    if o3 == 0 and _on_segment(b_start, a_start, b_end):
+        return True
+    if o4 == 0 and _on_segment(b_start, a_end, b_end):
+        return True
+    return False
+
+
+def validate_geometry(floorplan: Dict[str, Any]) -> List[str]:
+    """Return a list of geometry validation issues for the supplied floorplan."""
+
+    issues: List[str] = []
+    walls = {wall["id"]: wall for wall in floorplan.get("walls", [])}
+
+    for wall in walls.values():
+        length = math.hypot(wall["end"]["x"] - wall["start"]["x"], wall["end"]["y"] - wall["start"]["y"])
+        if length < MIN_WALL_LENGTH:
+            issues.append(
+                f"Wall '{wall['id']}' is shorter than the minimum length of {MIN_WALL_LENGTH:.0f} units (actual {length:.1f})."
+            )
+
+    for wall_a, wall_b in combinations(walls.values(), 2):
+        if any(
+            _points_close(endpoint_a, endpoint_b)
+            for endpoint_a in (wall_a["start"], wall_a["end"])
+            for endpoint_b in (wall_b["start"], wall_b["end"])
+        ):
+            continue
+        if _segments_intersect(wall_a["start"], wall_a["end"], wall_b["start"], wall_b["end"]):
+            issues.append(f"Walls '{wall_a['id']}' and '{wall_b['id']}' intersect. Adjust their anchors to avoid overlaps.")
+
+    for room in floorplan.get("rooms", []):
+        missing = [wall_id for wall_id in room.get("walls", []) if wall_id not in walls]
+        if missing:
+            issues.append(
+                f"Room '{room['name']}' references unknown walls: {', '.join(sorted(missing))}."
+            )
+
+    return issues
+
+
+def load_persisted_floorplan() -> Dict[str, Any]:
+    """Load the floorplan definition from disk or return the default template."""
+
+    if SCHEMATIC_STATE_PATH.exists():
+        try:
+            return normalise_floorplan(json.loads(SCHEMATIC_STATE_PATH.read_text()))
+        except (json.JSONDecodeError, ValidationError, ValueError):
+            pass
+    return json.loads(json.dumps(DEFAULT_SCHEMATIC))
+
+
+def save_floorplan(data: Dict[str, Any]) -> None:
+    """Persist the supplied floorplan JSON to disk."""
+
+    SCHEMATIC_STATE_PATH.write_text(json.dumps(data, indent=2, sort_keys=True))
 
 
 @dataclass(frozen=True)
@@ -995,6 +1279,73 @@ def main() -> None:
         "AUCg: area under the curve with respect to ground. "
         "AUCi: area under the curve with respect to increase."
     )
+
+    st.header("Laboratory schematic editor")
+    st.markdown(
+        """
+        Use the interactive editor to adjust the position of walls and annotate rooms. The toolbar
+        allows you to draw new walls, delete existing geometry, and toggle grid snapping. Every edit
+        is validated against the JSON schema defined for laboratory schematics before it is stored.
+        """
+    )
+
+    if "floorplan_data" not in st.session_state:
+        initial_floorplan = load_persisted_floorplan()
+        st.session_state["floorplan_data"] = initial_floorplan
+        st.session_state["floorplan_last_delta"] = None
+        st.session_state["floorplan_last_validation"] = validate_geometry(initial_floorplan)
+
+    current_floorplan = st.session_state["floorplan_data"]
+
+    component_response = floorplan_editor(
+        data=current_floorplan,
+        key="floorplan-editor",
+        height=720,
+    )
+
+    if component_response:
+        candidate_data = component_response.get("data", component_response)
+        try:
+            normalised = normalise_floorplan(candidate_data)
+        except ValidationError as exc:
+            st.error(f"Floorplan update rejected: {exc.message}")
+        except ValueError as exc:
+            st.error(f"Floorplan update rejected: {exc}")
+        else:
+            st.session_state["floorplan_data"] = normalised
+            st.session_state["floorplan_last_delta"] = component_response.get("delta", {})
+            st.session_state["floorplan_last_validation"] = validate_geometry(normalised)
+            current_floorplan = normalised
+
+    validation_messages = st.session_state.get("floorplan_last_validation", [])
+    if validation_messages:
+        with st.expander("Geometry validation messages", expanded=False):
+            for message in validation_messages:
+                st.warning(message)
+    else:
+        st.info("The current schematic passes the length and intersection checks.")
+
+    download_col, save_col = st.columns([1, 1])
+    with download_col:
+        st.download_button(
+            "Download schematic JSON",
+            data=json.dumps(current_floorplan, indent=2),
+            file_name="laboratory_schematic.json",
+            mime="application/json",
+        )
+
+    with save_col:
+        disabled = bool(validation_messages)
+        if disabled:
+            st.caption("Resolve geometry issues before saving to the shared state.")
+        if st.button("Save schematic to disk", type="primary", disabled=disabled):
+            save_floorplan(current_floorplan)
+            st.success("Schematic saved. Future sessions will load this version by default.")
+
+    delta = st.session_state.get("floorplan_last_delta")
+    if delta:
+        with st.expander("Latest edit delta", expanded=False):
+            st.json(delta)
 
 
 if __name__ == "__main__":
